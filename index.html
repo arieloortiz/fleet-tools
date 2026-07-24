@@ -2191,8 +2191,9 @@ function spShareToken(u){
   return 'u!' + b64.replace(/=+$/,'').replace(/\//g,'_').replace(/\+/g,'-');
 }
 
-// Download every Excel/CSV file inside a shared folder (or a single shared file)
-async function spFilesFromShare(shareUrl, token){
+// Download every Excel/CSV file inside a shared folder (or a single shared file).
+// label = human name for the status line; onProgress(done,total) fires per file.
+async function spFilesFromShare(shareUrl, token, label, onProgress){
   if(!shareUrl) return [];
   const tk  = spShareToken(shareUrl);
   const sel = '$select=name,file,folder,id,parentReference,@microsoft.graph.downloadUrl';
@@ -2203,6 +2204,7 @@ async function spFilesFromShare(shareUrl, token){
   if(root.folder){
     // Walk the whole folder tree — SOA files are organised in year/month subfolders,
     // so a one-level listing would miss everything.
+    if(label) spStatus(`Scanning ${label}…`, true);
     const driveId = root.parentReference && root.parentReference.driveId;
     const walk = async (itemId)=>{
       let url = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/children?${sel}&$top=200`;
@@ -2210,7 +2212,7 @@ async function spFilesFromShare(shareUrl, token){
         const page = await graphGet(url, token);
         for(const c of (page.value || [])){
           if(c.folder)      await walk(c.id);
-          else if(isXl(c))  entries.push(c);
+          else if(isXl(c)){ entries.push(c); if(label) spStatus(`Scanning ${label}… found ${entries.length}`, true); }
         }
         url = page['@odata.nextLink'] || null;   // follow pagination for large folders
       }
@@ -2219,6 +2221,7 @@ async function spFilesFromShare(shareUrl, token){
   } else if(isXl(root)){
     entries.push(root);
   }
+  const total = entries.length;
   const files = [];
   for(const it of entries){
     let blob;
@@ -2235,6 +2238,8 @@ async function spFilesFromShare(shareUrl, token){
       blob = await r.blob();
     }
     files.push(new File([blob], it.name, { type: blob.type }));
+    if(label) spStatus(`Downloading ${label}… ${files.length}/${total}`, true);
+    if(onProgress) onProgress(files.length, total);
   }
   console.log(`[Fleet] SharePoint share → ${files.length} spreadsheet(s):`, files.map(f=>f.name));
   return files;
@@ -2244,15 +2249,15 @@ async function spLoadFiles(token){
   // Pull the Vehicle Profile, Accredited Stations list, and SOA files from the
   // three pre-set share links, routing each to its matching loader.
   spStatus('Loading Vehicle Profile…', true);
-  const profFiles = await spFilesFromShare(SP_CONFIG.profileShareUrl, token);
+  const profFiles = await spFilesFromShare(SP_CONFIG.profileShareUrl, token, 'Vehicle Profile');
   if(profFiles[0]) await loadVehicleProfileFromFile(profFiles[0]);
 
   spStatus('Loading Accredited Stations…', true);
-  const staFiles = await spFilesFromShare(SP_CONFIG.stationsShareUrl, token);
+  const staFiles = await spFilesFromShare(SP_CONFIG.stationsShareUrl, token, 'Accredited Stations');
   if(staFiles[0]) await loadAccreditedStationsFromFile(staFiles[0]);
 
   spStatus('Loading SOA files…', true);
-  const soaFiles = await spFilesFromShare(SP_CONFIG.soaShareUrl, token);
+  const soaFiles = await spFilesFromShare(SP_CONFIG.soaShareUrl, token, 'SOA files');
   if(soaFiles.length) addFiles(soaFiles);
 
   if(!soaFiles.length && !staFiles[0] && !profFiles[0]){
