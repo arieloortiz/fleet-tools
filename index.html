@@ -2221,9 +2221,19 @@ async function spFilesFromShare(shareUrl, token){
   }
   const files = [];
   for(const it of entries){
+    let blob;
     const dl = it['@microsoft.graph.downloadUrl'];
-    if(!dl) continue;
-    const blob = await (await fetch(dl)).blob();     // downloadUrl is pre-authenticated
+    if(dl){
+      blob = await (await fetch(dl)).blob();                       // pre-authenticated when present
+    } else {
+      // /shares endpoint often omits downloadUrl — fetch via the authenticated /content route
+      const drv = it.parentReference && it.parentReference.driveId;
+      if(!drv || !it.id){ console.warn('[Fleet] no download path for', it.name); continue; }
+      const r = await fetch(`https://graph.microsoft.com/v1.0/drives/${drv}/items/${it.id}/content`,
+                            { headers:{ Authorization:`Bearer ${token}` } });
+      if(!r.ok){ console.warn('[Fleet] download failed', it.name, r.status); continue; }
+      blob = await r.blob();
+    }
     files.push(new File([blob], it.name, { type: blob.type }));
   }
   console.log(`[Fleet] SharePoint share → ${files.length} spreadsheet(s):`, files.map(f=>f.name));
