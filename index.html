@@ -2197,6 +2197,7 @@ async function spFilesFromShare(shareUrl, token){
   const tk  = spShareToken(shareUrl);
   const sel = '$select=name,file,folder,id,parentReference,@microsoft.graph.downloadUrl';
   const root = await graphGet(`https://graph.microsoft.com/v1.0/shares/${tk}/driveItem?${sel}`, token);
+  console.log('[Fleet] share resolved →', { name: root && root.name, isFolder: !!(root && root.folder), isFile: !!(root && root.file), driveId: root && root.parentReference && root.parentReference.driveId, childCount: root && root.folder && root.folder.childCount });
   const isXl = f => f.file && /\.(xlsx|xls|csv)$/i.test(f.name) && !f.name.startsWith('~$');
   const entries = [];
   if(root.folder){
