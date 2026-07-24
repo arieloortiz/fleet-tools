@@ -2195,23 +2195,37 @@ function spShareToken(u){
 async function spFilesFromShare(shareUrl, token){
   if(!shareUrl) return [];
   const tk  = spShareToken(shareUrl);
-  const sel = '$select=name,file,folder,@microsoft.graph.downloadUrl';
-  const item = await graphGet(`https://graph.microsoft.com/v1.0/shares/${tk}/driveItem?${sel}`, token);
-  let entries;
-  if(item.folder){
-    const kids = await graphGet(`https://graph.microsoft.com/v1.0/shares/${tk}/driveItem/children?${sel}&$top=200`, token);
-    entries = kids.value || [];
-  } else {
-    entries = [item];
+  const sel = '$select=name,file,folder,id,parentReference,@microsoft.graph.downloadUrl';
+  const root = await graphGet(`https://graph.microsoft.com/v1.0/shares/${tk}/driveItem?${sel}`, token);
+  const isXl = f => f.file && /\.(xlsx|xls|csv)$/i.test(f.name) && !f.name.startsWith('~$');
+  const entries = [];
+  if(root.folder){
+    // Walk the whole folder tree — SOA files are organised in year/month subfolders,
+    // so a one-level listing would miss everything.
+    const driveId = root.parentReference && root.parentReference.driveId;
+    const walk = async (itemId)=>{
+      let url = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/children?${sel}&$top=200`;
+      while(url){
+        const page = await graphGet(url, token);
+        for(const c of (page.value || [])){
+          if(c.folder)      await walk(c.id);
+          else if(isXl(c))  entries.push(c);
+        }
+        url = page['@odata.nextLink'] || null;   // follow pagination for large folders
+      }
+    };
+    await walk(root.id);
+  } else if(isXl(root)){
+    entries.push(root);
   }
-  const xl = entries.filter(f=>f.file && /\.(xlsx|xls|csv)$/i.test(f.name) && !f.name.startsWith('~$'));
   const files = [];
-  for(const it of xl){
+  for(const it of entries){
     const dl = it['@microsoft.graph.downloadUrl'];
     if(!dl) continue;
     const blob = await (await fetch(dl)).blob();     // downloadUrl is pre-authenticated
     files.push(new File([blob], it.name, { type: blob.type }));
   }
+  console.log(`[Fleet] SharePoint share → ${files.length} spreadsheet(s):`, files.map(f=>f.name));
   return files;
 }
 
