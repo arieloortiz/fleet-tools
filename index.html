@@ -896,7 +896,7 @@ let VEHICLE_PROFILE = {};
 let ALL_LABELS = [];      // display labels
 let ACTIVE_MONTHS = [];
 let ACTIVE_LABELS = [];
-let currentYearFilter = 'all';
+let selectedYears = new Set();   // empty = all years (multi-select)
 let currentPlate = null;
 let plateChart = null, chartConsume = null, chartAno = null, chartCompare = null;
 let _tplCollapsed = {0:false,1:false,2:true,3:true};
@@ -1937,10 +1937,10 @@ code{font-family:var(--mono);background:var(--surface2);padding:1px 5px;border-r
 }
 
 function initApp(){
-  currentYearFilter = 'All';
+  selectedYears = new Set();
   dateRangeFrom = null; dateRangeTo = null;
   updateScopeSummary();
-  // Build year filter buttons
+  // Build year filter buttons (multi-select: click several years to combine them)
   const yfRow = document.getElementById('yfRow');
   const years = ['All',...Object.keys(YEAR_MAP).sort()];
   yfRow.innerHTML = years.map(y=>`<button class="yf-btn ${y==='All'?'active':''}" onclick="setYear('${y}',this)">${y}</button>`).join('');
@@ -2023,7 +2023,7 @@ function updateScopeSummary(){
   const el = document.getElementById('scopeSummary');
   if(!el) return;
   const parts = [];
-  parts.push(currentYearFilter && currentYearFilter.toLowerCase()!=='all' ? currentYearFilter : 'All years');
+  parts.push(selectedYears.size ? [...selectedYears].sort().join(', ') : 'All years');
   if(selectedArea && selectedArea!=='all') parts.push(selectedArea);
   if(dateRangeFrom || dateRangeTo) parts.push(`${dateRangeFrom||'…'}–${dateRangeTo||'…'}`);
   el.textContent = parts.join(' · ');
@@ -2168,9 +2168,62 @@ async function spGetToken(interactive){
 
 async function graphGet(url, token){
   const r = await fetch(url, { headers:{ Authorization:`Bearer ${token}` } });
-  if(!r.ok) throw new Error(`Graph ${r.status}: ${await r.text()}`);
+  if(!r.ok){
+    const raw = await r.text();
+    let body = null; try{ body = JSON.parse(raw); }catch(_){}
+    const err = new Error(`Graph ${r.status}: ${(body&&body.error&&body.error.message)||raw}`);
+    err.status = r.status;
+    err.graph  = body && body.error;   // { code, message, ... }
+    throw err;
+  }
   return r.json();
 }
+
+// Turn a Graph/MSAL error into a friendly title + message + fix hint, then show the modal.
+function showSpError(e){
+  spShowLoadUI(false);
+  const ov = document.getElementById('spErrOverlay');
+  if(!ov) return;
+  const code   = (e && (e.errorCode || (e.graph && e.graph.code) || '')) + '';
+  const status = e && e.status;
+  const msg    = (e && (e.message || (e.graph && e.graph.message))) || 'Unknown error';
+  let title = 'Couldn’t load from SharePoint', friendly = msg, hint = '', retry = true;
+
+  if(status===403 || /accessDenied|notAllowed/i.test(code) || /sharing link no longer exists|do not have permission/i.test(msg)){
+    title = 'Access denied to a shared file';
+    friendly = 'A SharePoint sharing link has expired or your account doesn’t have permission to open it.';
+    hint = 'Re-share the SOA folder, Vehicle Profile and Accredited Stations files to your account (or generate fresh links), then update the app config. The link that failed is shown in Technical details.';
+  } else if(status===401 || /InvalidAuthenticationToken|login_required|interaction_required|expired/i.test(code+msg)){
+    title = 'Sign-in expired';
+    friendly = 'Your Microsoft session expired or was blocked. Please sign in again to continue syncing.';
+    hint = 'If this keeps happening in a private/InPrivate window, third-party cookies may be blocked — try a normal window.';
+  } else if(status===404 || /itemNotFound/i.test(code)){
+    title = 'Shared item not found';
+    friendly = 'One of the SharePoint links points to a file or folder that no longer exists (moved, renamed, or deleted).';
+    hint = 'Check the SOA / Profile / Stations share links in the app config and replace any that changed.';
+  } else if(/popup_window_error|user_cancelled|popup/i.test(code)){
+    title = 'Sign-in was interrupted';
+    friendly = 'The Microsoft sign-in popup was closed or blocked before completing.';
+    hint = 'Allow popups for this site, then click “Sign in & retry”.';
+  } else if(/AADSTS65001|consent/i.test(code+msg)){
+    title = 'Admin consent required';
+    friendly = 'The app hasn’t been granted permission to read your files yet.';
+    hint = 'An Azure admin needs to grant consent for Files.Read.All and Sites.Read.All on the app registration.';
+    retry = false;
+  }
+
+  document.getElementById('spErrTitle').textContent = title;
+  document.getElementById('spErrMsg').textContent   = friendly;
+  const hintEl = document.getElementById('spErrHint');
+  hintEl.textContent = hint; hintEl.style.display = hint ? 'block' : 'none';
+  const raw = [code && ('code: '+code), status && ('status: '+status), 'message: '+msg, (e&&e.graph&&e.graph.innerError&&('fixUrl: '+(e.graph.innerError.fixItUrl||e.graph.fixItUrl||'')))].filter(Boolean).join('\n');
+  document.getElementById('spErrRaw').textContent = raw;
+  document.getElementById('spErrDetails').style.display = 'block';
+  document.getElementById('spErrRetry').style.display = retry ? 'inline-block' : 'none';
+  ov.style.display = 'flex';
+  spStatus('✗ ' + title, false);
+}
+function closeSpError(){ const ov=document.getElementById('spErrOverlay'); if(ov) ov.style.display='none'; }
 
 async function spConnect(){        // button click — interactive allowed
   try{
@@ -2181,7 +2234,7 @@ async function spConnect(){        // button click — interactive allowed
     await spLoadFiles(token);
   }catch(e){
     console.error('SharePoint connect failed:', e);
-    spStatus('✗ ' + (e.errorCode||e.message||'Sign-in failed'), false);
+    showSpError(e);
   }
 }
 
@@ -2273,32 +2326,53 @@ async function spLoadFiles(token){
   const phase = (base, span, label) => (done, total) =>
     spSetLoadProgress(base + (total ? span*done/total : 0),
                       total ? `${label} ${done}/${total}` : `${label}…`);
+  // Each share is fetched independently: one failing link (expired/no permission)
+  // must not stop the others. Collect any errors and surface them afterward.
+  const errors = [];
+  const tryShare = async (url, label, prog) => {
+    try{ return await spFilesFromShare(url, token, label, prog); }
+    catch(e){ console.error(`[Fleet] ${label} failed:`, e); e._label = label; errors.push(e); return []; }
+  };
 
   spSetLoadProgress(2, 'Loading Vehicle Profile…'); spStatus('Loading Vehicle Profile…', true);
-  const profFiles = await spFilesFromShare(SP_CONFIG.profileShareUrl, token, 'Vehicle Profile', phase(2,8,'Vehicle Profile'));
+  const profFiles = await tryShare(SP_CONFIG.profileShareUrl, 'Vehicle Profile', phase(2,8,'Vehicle Profile'));
   if(profFiles[0]) await loadVehicleProfileFromFile(profFiles[0]);
 
   spSetLoadProgress(10, 'Loading Accredited Stations…'); spStatus('Loading Accredited Stations…', true);
-  const staFiles = await spFilesFromShare(SP_CONFIG.stationsShareUrl, token, 'Accredited Stations', phase(10,8,'Accredited Stations'));
+  const staFiles = await tryShare(SP_CONFIG.stationsShareUrl, 'Accredited Stations', phase(10,8,'Accredited Stations'));
   if(staFiles[0]) await loadAccreditedStationsFromFile(staFiles[0]);
 
   spSetLoadProgress(18, 'Loading SOA files…'); spStatus('Loading SOA files…', true);
-  const soaFiles = await spFilesFromShare(SP_CONFIG.soaShareUrl, token, 'SOA files', phase(18,80,'SOA files'));
+  const soaFiles = await tryShare(SP_CONFIG.soaShareUrl, 'SOA files', phase(18,80,'SOA files'));
   if(soaFiles.length) addFiles(soaFiles);
 
+  // Nothing loaded at all → show the error window (use the first real error if any).
   if(!soaFiles.length && !staFiles[0] && !profFiles[0]){
     spShowLoadUI(false);
-    spStatus('✗ No Excel/CSV files found in the linked folders', false);
+    if(errors.length) showSpError(errors[0]);
+    else spStatus('✗ No Excel/CSV files found in the linked folders', false);
     return;
   }
   const bits = [];
   if(soaFiles.length) bits.push(`${soaFiles.length} SOA`);
   if(staFiles[0])     bits.push('stations');
   if(profFiles[0])    bits.push('profile');
+
+  // Partial success → keep what loaded queued, flag the failed link in the error
+  // window, and let the user dismiss + click Analyse (don't slide the dashboard
+  // in behind the modal).
+  if(errors.length){
+    const e = errors[0];
+    e.message = `${e._label}: ${e.message||''}`;
+    spShowLoadUI(false);
+    spStatus(`⚠ Loaded ${bits.join(' + ')||'nothing'} — ${e._label} failed`, false);
+    showSpError(e);
+    return;
+  }
+
+  // Everything loaded — kick off analysis directly (processFiles reuses this bar).
   spSetLoadProgress(100, 'Files loaded');
   spStatus(`✓ Synced ${bits.join(' + ')} — analysing…`, true);
-
-  // Files are in — kick off analysis directly (processFiles reuses this same bar).
   if(soaFiles.length){
     processFiles();
   } else {
@@ -2681,26 +2755,42 @@ function getFilteredTxns(plate){
 }
 
 function setYear(yr, btn){
-  currentYearFilter=yr;
+  // Multi-select: "All" clears the selection (= every year); a year toggles on/off.
+  if(yr==='All'){
+    selectedYears.clear();
+  } else {
+    if(selectedYears.has(yr)) selectedYears.delete(yr);
+    else                      selectedYears.add(yr);
+  }
+  applyYearFilter();
+}
+
+function applyYearFilter(){
   // Reset date range
   dateRangeFrom=null; dateRangeTo=null;
   const df=document.getElementById('drFrom'); const dt=document.getElementById('drTo');
   if(df){df.value='';df.classList.remove('active');}
   if(dt){dt.value='';dt.classList.remove('active');}
   const dc=document.getElementById('drClear'); if(dc) dc.style.display='none';
-  updateScopeSummary();
   // Reset anomaly filter
   activeAnomFilters = new Set(['all']);
   syncAnomChipUI();
-  document.querySelectorAll('#yfRow .yf-btn').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  if(yr==='All'){
+  // Highlight every selected year button ("All" lit only when nothing is selected)
+  document.querySelectorAll('#yfRow .yf-btn').forEach(b=>{
+    const label=b.textContent.trim();
+    const on = label==='All' ? selectedYears.size===0 : selectedYears.has(label);
+    b.classList.toggle('active', on);
+  });
+  // Active months = union of every selected year's months (empty selection = all)
+  if(selectedYears.size===0){
     ACTIVE_MONTHS=[...ALL_MONTHS]; ACTIVE_LABELS=[...ALL_LABELS];
   } else {
-    const keys=YEAR_MAP[yr]||ALL_MONTHS;
-    ACTIVE_MONTHS=ALL_MONTHS.filter(m=>keys.includes(m));
+    const keys=new Set();
+    [...selectedYears].forEach(y=>(YEAR_MAP[y]||[]).forEach(k=>keys.add(k)));
+    ACTIVE_MONTHS=ALL_MONTHS.filter(m=>keys.has(m));
     ACTIVE_LABELS=ACTIVE_MONTHS.map(m=>ALL_LABELS[ALL_MONTHS.indexOf(m)]);
   }
+  updateScopeSummary();
   buildTopPlates();
   buildFleetKPIs();
   rebuildCharts();
@@ -4393,6 +4483,28 @@ function rmTab(id, btn){
       <div id="rm-features" class="rm-section" style="display:none"></div>
       <div id="rm-formats" class="rm-section" style="display:none"></div>
       <div id="rm-glossary" class="rm-section" style="display:none"></div>
+    </div>
+  </div>
+</div>
+
+<!-- SHAREPOINT ERROR MODAL -->
+<div id="spErrOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.72);backdrop-filter:blur(5px);z-index:9500;display:none;align-items:center;justify-content:center;padding:20px" onclick="if(event.target===this)closeSpError()">
+  <div style="background:var(--surface);border:1px solid var(--border2);border-radius:14px;width:100%;max-width:480px;overflow:hidden;box-shadow:var(--shadow-lg)">
+    <div style="display:flex;align-items:center;gap:12px;padding:20px 24px 14px">
+      <div id="spErrIcon" style="flex-shrink:0;width:38px;height:38px;border-radius:10px;background:rgba(255,69,58,.14);display:flex;align-items:center;justify-content:center;font-size:20px">⚠</div>
+      <div style="font-family:var(--sans);font-size:16px;font-weight:600;color:var(--text)" id="spErrTitle">Couldn't load from SharePoint</div>
+    </div>
+    <div style="padding:0 24px 8px 24px">
+      <p id="spErrMsg" style="font-family:var(--sans);font-size:13px;line-height:1.6;color:var(--muted);margin:0"></p>
+      <p id="spErrHint" style="font-family:var(--sans);font-size:12px;line-height:1.6;color:var(--dim);margin:12px 0 0"></p>
+      <details id="spErrDetails" style="margin-top:14px;display:none">
+        <summary style="font-family:var(--mono);font-size:10px;color:var(--dim);cursor:pointer;text-transform:uppercase;letter-spacing:.06em">Technical details</summary>
+        <pre id="spErrRaw" style="font-family:var(--mono);font-size:10px;color:var(--muted);background:var(--surface2);border-radius:8px;padding:12px;margin-top:8px;white-space:pre-wrap;word-break:break-word;max-height:180px;overflow:auto"></pre>
+      </details>
+    </div>
+    <div style="display:flex;gap:10px;justify-content:flex-end;padding:18px 24px 22px">
+      <button onclick="closeSpError()" style="background:var(--surface2);border:none;color:var(--muted);padding:9px 18px;border-radius:9px;cursor:pointer;font-family:var(--sans);font-size:13px;font-weight:600">Dismiss</button>
+      <button id="spErrRetry" onclick="closeSpError();spConnect()" style="background:var(--accent);border:none;color:#fff;padding:9px 18px;border-radius:9px;cursor:pointer;font-family:var(--sans);font-size:13px;font-weight:600">Sign in &amp; retry</button>
     </div>
   </div>
 </div>
