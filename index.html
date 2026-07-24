@@ -2245,22 +2245,49 @@ async function spFilesFromShare(shareUrl, token, label, onProgress){
   return files;
 }
 
+// Drive the Analyse button's own progress bar (btnFill + up-progress track) so
+// SharePoint loading shares the same visual as analysis instead of a tiny pill.
+function spShowLoadUI(on, label){
+  const prog = document.getElementById('upProgress');
+  const btn  = document.getElementById('processBtn');
+  const lbl  = document.getElementById('btnLabel');
+  if(prog) prog.classList.toggle('active', !!on);
+  if(btn){ btn.disabled = !!on; btn.classList.toggle('is-processing', !!on); }
+  if(on && lbl) lbl.innerHTML = '<span class="ic ic-cloud ic-sm" style="margin-right:7px"></span>'+(label||'Loading from SharePoint…');
+}
+function spSetLoadProgress(pct, stage){
+  const p = Math.max(0, Math.min(100, pct));
+  const progFill=document.getElementById('progFill'), progPct=document.getElementById('progPct'),
+        progStage=document.getElementById('progStage'), bar=document.getElementById('btnFill');
+  if(progFill) progFill.style.width = p+'%';
+  if(progPct)  progPct.textContent  = Math.round(p)+'%';
+  if(stage && progStage) progStage.textContent = stage;
+  if(bar) bar.style.width = p+'%';
+}
+
 async function spLoadFiles(token){
   // Pull the Vehicle Profile, Accredited Stations list, and SOA files from the
   // three pre-set share links, routing each to its matching loader.
-  spStatus('Loading Vehicle Profile…', true);
-  const profFiles = await spFilesFromShare(SP_CONFIG.profileShareUrl, token, 'Vehicle Profile');
+  // A phase maps this share's per-file callback onto a slice of the 0-100 bar.
+  spShowLoadUI(true);
+  const phase = (base, span, label) => (done, total) =>
+    spSetLoadProgress(base + (total ? span*done/total : 0),
+                      total ? `${label} ${done}/${total}` : `${label}…`);
+
+  spSetLoadProgress(2, 'Loading Vehicle Profile…'); spStatus('Loading Vehicle Profile…', true);
+  const profFiles = await spFilesFromShare(SP_CONFIG.profileShareUrl, token, 'Vehicle Profile', phase(2,8,'Vehicle Profile'));
   if(profFiles[0]) await loadVehicleProfileFromFile(profFiles[0]);
 
-  spStatus('Loading Accredited Stations…', true);
-  const staFiles = await spFilesFromShare(SP_CONFIG.stationsShareUrl, token, 'Accredited Stations');
+  spSetLoadProgress(10, 'Loading Accredited Stations…'); spStatus('Loading Accredited Stations…', true);
+  const staFiles = await spFilesFromShare(SP_CONFIG.stationsShareUrl, token, 'Accredited Stations', phase(10,8,'Accredited Stations'));
   if(staFiles[0]) await loadAccreditedStationsFromFile(staFiles[0]);
 
-  spStatus('Loading SOA files…', true);
-  const soaFiles = await spFilesFromShare(SP_CONFIG.soaShareUrl, token, 'SOA files');
+  spSetLoadProgress(18, 'Loading SOA files…'); spStatus('Loading SOA files…', true);
+  const soaFiles = await spFilesFromShare(SP_CONFIG.soaShareUrl, token, 'SOA files', phase(18,80,'SOA files'));
   if(soaFiles.length) addFiles(soaFiles);
 
   if(!soaFiles.length && !staFiles[0] && !profFiles[0]){
+    spShowLoadUI(false);
     spStatus('✗ No Excel/CSV files found in the linked folders', false);
     return;
   }
@@ -2268,11 +2295,15 @@ async function spLoadFiles(token){
   if(soaFiles.length) bits.push(`${soaFiles.length} SOA`);
   if(staFiles[0])     bits.push('stations');
   if(profFiles[0])    bits.push('profile');
-  if(SP_CONFIG.autoAnalyze && soaFiles.length){
-    spStatus(`✓ Synced ${bits.join(' + ')} — analysing…`, true);
+  spSetLoadProgress(100, 'Files loaded');
+  spStatus(`✓ Synced ${bits.join(' + ')} — analysing…`, true);
+
+  // Files are in — kick off analysis directly (processFiles reuses this same bar).
+  if(soaFiles.length){
     processFiles();
   } else {
-    spStatus(`✓ Synced ${bits.join(' + ')} — click Analyse Files`, true);
+    spShowLoadUI(false);
+    spStatus(`✓ Synced ${bits.join(' + ')}`, true);
   }
 }
 
